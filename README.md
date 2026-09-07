@@ -34,8 +34,10 @@ upstream plugin version number.
   [CHANGELOG.md](CHANGELOG.md) → **v1.0.5** for the full rationale and the caveat for
   older Live models.
 - **Realtime stability tweaks:** stash-and-replay of tool results across
-  `update_tools` reconnects, and conditionalized generation triggers for non-Vertex
-  (Gemini API) models.
+  `update_tools` reconnects; gemini-3.1 Live support (`generate_reply` routed through
+  realtime text input, and dropping `model_turn` parts that arrive after a turn is
+  already finalized); and emitting recoverable connection errors *after* the retry
+  backoff rather than before it.
 
 For the exact per-tag differences, see **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -44,13 +46,13 @@ For the exact per-tag differences, see **[CHANGELOG.md](CHANGELOG.md)**.
 Install a specific tag directly from Git — always pin a tag, never `main`:
 
 ```bash
-pip install "git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.5"
+pip install "git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.6"
 ```
 
 Or in `requirements.txt` / `pyproject.toml`:
 
 ```
-livekit-plugins-google @ git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.5
+livekit-plugins-google @ git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.6
 ```
 
 ## Choosing a version
@@ -60,6 +62,7 @@ the plugin depends on internal `livekit-agents` APIs, so mismatched versions bre
 
 | Fork tag | `livekit-plugins-google` | `livekit` | `livekit-agents` |
 | -------- | ------------------------ | --------- | ---------------- |
+| `v1.0.6` | 1.8.0                    | 1.1.17    | 1.8.0            |
 | `v1.0.5` | 1.6.7                    | 1.1.13    | 1.6.7            |
 | `v1.0.4` | 1.6.4                    | 1.1.12    | 1.6.4            |
 | `v1.0.3` | 1.5.17                   | 1.1.8     | 1.5.17           |
