@@ -814,7 +814,13 @@ class RealtimeSession(llm.RealtimeSession):
         if "3.1" in self._opts.model:
             # 3.1 Live has no mutable chat context, so the placeholder-turn trick below is
             # rejected. It does accept realtime text input, which triggers a generation.
-            self._send_client_event(types.LiveClientRealtimeInput(text=instructions))
+            # `instructions` is often NOT_GIVEN (agent_activity passes `instructions or
+            # NOT_GIVEN`), so fall back to the same "." nudge used for the other models.
+            self._send_client_event(
+                types.LiveClientRealtimeInput(
+                    text=instructions if is_given(instructions) else "."
+                )
+            )
         else:
             # Gemini requires the last message to end with user's turn
             # so we need to add a placeholder user turn in order to trigger a new generation

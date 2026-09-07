@@ -66,7 +66,9 @@ in behaviour.
   treats as "no agent-initiated turns at all" — `generate_reply` raises `RealtimeError`,
   so greetings, handoffs and post-tool prompts never happen. 3.1 does honour
   `LiveClientRealtimeInput(text=...)`, so `generate_reply` is routed through that on 3.1
-  and keeps the placeholder-user-turn path on 2.x. 3.1 also streams `model_turn` parts
+  and keeps the placeholder-user-turn path on 2.x. `instructions` is often `NOT_GIVEN`
+  (`agent_activity` passes `instructions or NOT_GIVEN`), so the 3.1 branch falls back to
+  the same `"."` nudge the 2.x path uses rather than putting the sentinel on the wire. 3.1 also streams `model_turn` parts
   after a turn is finalized (most visibly after a tool call); upstream opens a fresh
   generation for them and replays stale audio, so a `_generation_completed` flag now
   tracks whether the turn is still open and drops the trailing parts.
