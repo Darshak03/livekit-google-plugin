@@ -46,13 +46,13 @@ For the exact per-tag differences, see **[CHANGELOG.md](CHANGELOG.md)**.
 Install a specific tag directly from Git — always pin a tag, never `main`:
 
 ```bash
-pip install "git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.6"
+pip install "git+https://github.com/Darshak03/livekit-google-plugin.git@v1.0.6"
 ```
 
 Or in `requirements.txt` / `pyproject.toml`:
 
 ```
-livekit-plugins-google @ git+https://github.com/heershah434/livekit-google-plugin.git@v1.0.6
+livekit-plugins-google @ git+https://github.com/Darshak03/livekit-google-plugin.git@v1.0.6
 ```
 
 ## Choosing a version
@@ -69,7 +69,7 @@ the plugin depends on internal `livekit-agents` APIs, so mismatched versions bre
 | `v1.0.2` | 1.5.4                    | 1.1.5     | 1.5.4            |
 
 Full details and older tags: **[CHANGELOG.md](CHANGELOG.md)**. All published tags:
-<https://github.com/heershah434/livekit-google-plugin/tags>.
+<https://github.com/Darshak03/livekit-google-plugin/tags>.
 
 ## Relationship to upstream
 
