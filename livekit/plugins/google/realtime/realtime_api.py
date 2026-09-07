@@ -90,6 +90,13 @@ def _validate_model_api_match(model: str, use_vertexai: bool) -> None:
         )
 
 
+def _warn_vertex_scheduling_unsupported() -> None:
+    logger.warning(
+        "tool_response_scheduling is not supported by Vertex AI and will be ignored; "
+        "tool responses use the default scheduling there."
+    )
+
+
 def _get_1008_error_hint(error_message: str) -> str | None:
     """
     Generate a hint for WebSocket 1008 policy violation errors.
@@ -296,6 +303,8 @@ class RealtimeModel(llm.RealtimeModel):
             if is_given(vertexai)
             else os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "0").lower() in ["true", "1"]
         )
+        if use_vertexai and is_given(tool_response_scheduling):
+            _warn_vertex_scheduling_unsupported()
         if not is_given(model):
             model = (
                 "gemini-live-2.5-flash-native-audio"
@@ -407,7 +416,9 @@ class RealtimeModel(llm.RealtimeModel):
         else:
             return "Gemini"
 
-    def session(self) -> RealtimeSession:
+    def session(self, *, turn_detection_disabled: bool = False) -> RealtimeSession:
+        # Gemini drives manual turns via activity_start/activity_end, not commit_audio/clear_audio,
+        # so the pipeline can't gatekeep turns yet; keep can_disable_turn_detection=False for now
         sess = RealtimeSession(self)
         self._sessions.add(sess)
         return sess
@@ -497,12 +508,20 @@ class RealtimeSession(llm.RealtimeSession):
         self._main_atask = asyncio.create_task(self._main_task(), name="gemini-realtime-session")
 
         self._current_generation: _ResponseGeneration | None = None
-        self._active_session: AsyncSession | None = None
+        # False between a generation starting and its generation_complete/turn_complete.
+        # used to drop model_turn events that arrive after a turn is already finalized.
         self._generation_completed = True
+        self._active_session: AsyncSession | None = None
+        # tool result held back while the session restarts, replayed on reconnect
+        self._pending_tool_result: types.LiveClientToolResponse | None = None
         # indicates if the underlying session should end
         self._session_should_close = asyncio.Event()
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
         self._pending_generation_fut: asyncio.Future[llm.GenerationCreatedEvent] | None = None
+        # number of tool calls rejected in the current tool_choice="none" turn; non-zero also
+        # means we're draining that turn's trailing events (which have no generation to attach
+        # to). reset when the next generation starts.
+        self._rejected_tool_calls = 0
 
         self._session_resumption_handle: str | None = (
             self._opts.session_resumption.handle
@@ -513,9 +532,6 @@ class RealtimeSession(llm.RealtimeSession):
         self._in_user_activity = False
         self._session_lock = asyncio.Lock()
         self._num_retries = 0
-        self._pending_tool_result: types.LiveClientToolResponse | None = None
-        # number of tool calls rejected in the current tool_choice="none" turn
-        self._rejected_tool_calls = 0
         # error recorded by the recv/send tasks so _main_task can bound retries
         # and surface it through the "error" event
         self._session_error: Exception | None = None
@@ -540,7 +556,7 @@ class RealtimeSession(llm.RealtimeSession):
                     if isinstance(msg, types.LiveClientContent) and msg.turn_complete is True:
                         logger.warning(
                             "discarding client content for turn completion, may cause generate_reply timeout",
-                            extra={"content": str(msg)},
+                            extra={"lk.pii.content": str(msg)},
                         )
 
             self._msg_ch = utils.aio.Chan[ClientEvents]()
@@ -572,6 +588,8 @@ class RealtimeSession(llm.RealtimeSession):
             and self._opts.tool_response_scheduling != tool_response_scheduling
         ):
             self._opts.tool_response_scheduling = tool_response_scheduling
+            if self._opts.vertexai:
+                _warn_vertex_scheduling_unsupported()
             # no need to restart
 
         if is_given(tool_choice):
@@ -657,21 +675,42 @@ class RealtimeSession(llm.RealtimeSession):
                 append_ctx.items.append(item)
 
         if append_ctx.items:
+            # vertex drops `scheduling`, and Gemini reads it only on NON_BLOCKING tools
+            supports_silent_scheduling = (
+                not self._opts.vertexai and self._opts.tool_behavior == types.Behavior.NON_BLOCKING
+            )
+            if not supports_silent_scheduling and (
+                silenced := [
+                    item.name
+                    for item in append_ctx.items
+                    if item.type == "function_call_output" and not item.reply_required
+                ]
+            ):
+                logger.warning(
+                    "a tool result wants no reply, but Gemini will answer it anyway; declare "
+                    "the tools NON_BLOCKING on the Gemini API to keep it silent. Sending it "
+                    "regardless, since an unanswered call blocks the session.",
+                    extra={"functions": silenced},
+                )
+
             tool_results = get_tool_results_for_realtime(
                 append_ctx,
                 vertexai=self._opts.vertexai,
                 tool_response_scheduling=self._opts.tool_response_scheduling,
+                supports_silent_scheduling=supports_silent_scheduling,
             )
             if self._session_should_close.is_set():
-                # session is restarting due to update_tools — stash for replay after reconnect
+                # the session is restarting (update_tools). anything sent now goes into a
+                # socket that is about to close, and the tool call would stay unanswered
+                # forever. stash the result and replay it once the new session is up.
                 if tool_results:
-                    logger.warning("[RESTART] stashing tool result for replay after reconnect")
+                    logger.debug("stashing tool result for replay after session restart")
                     self._pending_tool_result = tool_results
             else:
                 if self._realtime_model.capabilities.mutable_chat_context:
-                    turns_dict, _ = append_ctx.copy(exclude_function_call=True).to_provider_format(
-                        format="google", inject_dummy_user_message=False
-                    )
+                    turns_dict, _ = append_ctx.copy(
+                        exclude_function_call=True
+                    ).to_provider_format(format="google", inject_dummy_user_message=False)
                     turns = [types.Content.model_validate(turn) for turn in turns_dict]
                     if turns:
                         self._send_client_event(
@@ -747,16 +786,10 @@ class RealtimeSession(llm.RealtimeSession):
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
         if is_given(tools):
             logger.warning("per-response tools is not supported by Google Realtime API, ignoring")
-        # if not self._realtime_model.capabilities.mutable_chat_context:
-        #     logger.warning(
-        #         f"generate_reply is not compatible with '{self._opts.model}' and will be ignored."
-        #     )
-        #     fut = asyncio.Future[llm.GenerationCreatedEvent]()
-        #     fut.set_exception(
-        #         llm.RealtimeError(f"generate_reply is not compatible with '{self._opts.model}'")
-        #     )
-        #     return fut
-
+        # Upstream refuses generate_reply whenever mutable_chat_context is False, which
+        # is every gemini-3.1 Live model. We depend on generate_reply for agent-initiated
+        # turns (greetings, handoffs, post-tool prompts), and 3.1 does honour a realtime
+        # text input -- see the model branch below. Allow it through instead of failing.
         if self._pending_generation_fut and not self._pending_generation_fut.done():
             logger.warning(
                 "generate_reply called while another generation is pending, cancelling previous."
@@ -778,7 +811,9 @@ class RealtimeSession(llm.RealtimeSession):
             )
             self._in_user_activity = False
 
-        if "gemini-3.1-flash-live-preview" == self._opts.model:
+        if "3.1" in self._opts.model:
+            # 3.1 Live has no mutable chat context, so the placeholder-turn trick below is
+            # rejected. It does accept realtime text input, which triggers a generation.
             self._send_client_event(types.LiveClientRealtimeInput(text=instructions))
         else:
             # Gemini requires the last message to end with user's turn
@@ -868,6 +903,15 @@ class RealtimeSession(llm.RealtimeSession):
         if self._current_generation:
             self._mark_current_generation_done()
 
+        # release the genai http clients owned by this session. Without this
+        # they stay open until the garbage collector runs `AsyncClient.__del__`,
+        # which schedules `aclose()` on whatever event loop happens to be
+        # running at that moment.
+        try:
+            await self._client.aio.aclose()
+        except Exception:
+            logger.warning("failed to close the genai client", exc_info=True)
+
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
         max_retries = self._opts.conn_options.max_retry
@@ -920,22 +964,35 @@ class RealtimeSession(llm.RealtimeSession):
                             )
 
                     if self._pending_tool_result:
-                        logger.warning("[RESTART] replaying stashed tool result to new session")
+                        logger.debug("replaying stashed tool result to the new session")
                         tool_result = self._pending_tool_result
                         self._pending_tool_result = None
                         await session.send_tool_response(
                             function_responses=tool_result.function_responses
                         )
-                        # trigger model to respond to the tool result
-                        # Dump the tool result directly into the user message
+                        # the replayed response alone does not make the model speak, since
+                        # the new session never saw the originating call. restate the result
+                        # as a user turn to trigger a generation. vertex is excluded: it
+                        # keeps server-side history and answers the response on its own.
                         if not self._opts.vertexai:
-                            result_str = str([r.response for r in tool_result.function_responses])
+                            result_str = str(
+                                [r.response for r in tool_result.function_responses]
+                            )
                             await session.send_client_content(
                                 turns=[
-                                    types.Content(parts=[types.Part(text=f"Tool returned: {result_str}. Please proceed.")],
-                                                  role="user")],
+                                    types.Content(
+                                        parts=[
+                                            types.Part(
+                                                text=f"Tool returned: {result_str}. "
+                                                "Please proceed."
+                                            )
+                                        ],
+                                        role="user",
+                                    )
+                                ],
                                 turn_complete=True,
                             )
+
                     # queue up existing chat context
                     send_task = asyncio.create_task(
                         self._send_task(session), name="gemini-realtime-send"
@@ -1021,6 +1078,9 @@ class RealtimeSession(llm.RealtimeSession):
                         extra={"attempt": self._num_retries, "max_retries": max_retries},
                     )
                     await asyncio.sleep(retry_interval)
+                    # emit after the backoff: our error handler tears the agent session
+                    # down, and firing it before the sleep kills the session we are about
+                    # to reconnect, turning a recoverable blip into a dropped call.
                     self._emit_error(e, recoverable=True)
                     self._num_retries += 1
             finally:
@@ -1068,7 +1128,7 @@ class RealtimeSession(llm.RealtimeSession):
                     ):
                         logger.debug(
                             f">>> sent {type(msg).__name__}",
-                            extra={"content": msg.model_dump(exclude_defaults=True)},
+                            extra={"lk.pii.content": msg.model_dump(exclude_defaults=True)},
                         )
 
         except Exception as e:
@@ -1101,7 +1161,7 @@ class RealtimeSession(llm.RealtimeSession):
                             for part in parts:
                                 if part and part.get("inline_data"):
                                     part["inline_data"] = "<audio>"
-                        logger.debug("<<< received response", extra={"response": resp_copy})
+                        logger.debug("<<< received response", extra={"lk.pii.response": resp_copy})
 
                     if response.tool_call and self._opts.tool_choice == "none":
                         # reject without opening a generation, so the pending generate_reply
@@ -1110,8 +1170,17 @@ class RealtimeSession(llm.RealtimeSession):
                         self._reject_tool_calls(response.tool_call.function_calls or [])
                         continue
 
-                    if (not self._current_generation or self._current_generation._done)  and not self._generation_completed and response.server_content and response.server_content.model_turn:
+                    if (
+                        (not self._current_generation or self._current_generation._done)
+                        and not self._generation_completed
+                        and response.server_content
+                        and response.server_content.model_turn
+                    ):
+                        # 3.1 keeps streaming model_turn parts after we finalized the
+                        # generation (e.g. a tool call closed it). Opening a fresh
+                        # generation for them replays stale audio, so drop them.
                         return
+
                     if not self._current_generation or self._current_generation._done:
                         if (sc := response.server_content) and sc.interrupted:
                             # two cases an interrupted event is sent without an active generation
@@ -1292,18 +1361,27 @@ class RealtimeSession(llm.RealtimeSession):
             if self._rejected_tool_calls:
                 logger.debug(
                     "ignoring server content from a rejected tool call turn",
-                    extra={"server_content": server_content.model_dump_json(exclude_none=True)},
+                    extra={
+                        "lk.pii.server_content": server_content.model_dump_json(exclude_none=True)
+                    },
                 )
             else:
                 logger.warning("received server content but no active generation.")
             return
+
+        # With audio output and output transcription on, spoken words arrive through
+        # output_transcription. Model-turn text is not spoken and must not leak into captions.
+        forward_model_text = (
+            not self._realtime_model.capabilities.audio_output
+            or self._opts.output_audio_transcription is None
+        )
 
         if model_turn := server_content.model_turn:
             for part in model_turn.parts or []:
                 if part.thought:
                     # bypass reasoning output
                     continue
-                if part.text:
+                if part.text and forward_model_text:
                     current_gen.push_text(part.text)
                 if part.inline_data:
                     if current_gen.audio_ch.closed:
@@ -1345,6 +1423,7 @@ class RealtimeSession(llm.RealtimeSession):
                         item_id=current_gen.input_id,
                         transcript=current_gen.input_transcription,
                         is_final=False,
+                        turn_started_at=current_gen._created_timestamp,
                     ),
                 )
 
@@ -1387,6 +1466,7 @@ class RealtimeSession(llm.RealtimeSession):
                     item_id=gen.input_id,
                     transcript=gen.input_transcription,
                     is_final=True,
+                    turn_started_at=gen._created_timestamp,
                 ),
             )
 
@@ -1411,7 +1491,7 @@ class RealtimeSession(llm.RealtimeSession):
         gen.message_ch.close()
         gen._done = True
         if lk_google_debug:
-            logger.debug(f"generation done {gen}")
+            logger.debug("generation done", extra={"lk.pii.generation": str(gen)})
 
     def _close_output_streams(self, gen: _ResponseGeneration) -> None:
         # ends the audio segment and finalizes the output transcript. called on
@@ -1481,7 +1561,9 @@ class RealtimeSession(llm.RealtimeSession):
                     arguments=arguments,
                 )
             )
-        if self._opts.model == "gemini-3.1-flash-live-preview":
+        if "3.1" in self._opts.model:
+            # a tool call ends the turn on 3.1 without a generation_complete, so mark it
+            # here; anything streamed afterwards belongs to the finalized turn.
             self._generation_completed = True
         self._mark_current_generation_done()
 

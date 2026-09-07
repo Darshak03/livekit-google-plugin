@@ -15,6 +15,7 @@ release **tags** (`v1.0.x`), which are independent of the upstream
 
 | Fork tag | Upstream plugin base | `livekit` (SDK) | `livekit-agents` | pin in `pyproject.toml` |
 | -------- | -------------------- | --------------- | ---------------- | ----------------------- |
+| `v1.0.6` | 1.8.0                | 1.1.17          | 1.8.0            | `livekit-agents>=1.8.0,<1.9` |
 | `v1.0.5` | 1.6.7                | 1.1.13          | 1.6.7            | `livekit-agents>=1.6.7` |
 | `v1.0.4` | 1.6.4                | 1.1.12          | 1.6.4            | `livekit-agents>=1.6.4` |
 | `v1.0.3` | 1.5.17               | 1.1.8           | 1.5.17           | `livekit-agents>=1.5.17`|
@@ -28,6 +29,71 @@ only the `livekit-agents>=1.5.0` floor from `pyproject.toml` is known.
 The fork tracks `livekit-agents` closely: the plugin depends on internal
 `livekit-agents` APIs, so a fork tag must be paired with the matching
 `livekit-agents` version above.
+
+---
+
+## v1.0.6 — sync to upstream plugin 1.8.0 (livekit-agents 1.8.0)
+
+**Compatibility:** `livekit==1.1.17`, `livekit-agents==1.8.0`.
+**Base:** upstream `livekit-plugins-google` 1.8.0 (synced from 1.6.7).
+
+**This sync is required, not optional.** `livekit-agents` 1.8.0 calls
+`llm.session(turn_detection_disabled=...)` unconditionally
+(`voice/agent_activity.py:1086`) and upstream widened `RealtimeModel.session()` to
+match. `v1.0.5` still declares `def session(self)`, so on agents 1.8.0 **every**
+realtime session creation raises `TypeError`. There is no configuration that avoids
+this; `v1.0.5` and `livekit-agents==1.8.0` cannot be paired.
+
+**No fork patch was fixed upstream.** Diffed 1.6.7 against 1.8.0 before re-applying:
+`schema.pop("default", None)` (`utils.py:153`), `use_parameters_json_schema=False`
+(`realtime_api.py:1187`), the `generate_reply` `mutable_chat_context` guard
+(`realtime_api.py:776`) and the pre-backoff `_emit_error` are all still present in
+1.8.0, and no tool-result replay exists. All four patches carried forward unchanged
+in behaviour.
+
+**Fork patches in this tag** (unchanged from v1.0.5 unless noted):
+- **Realtime tool params preserve pre-filled values** — `use_parameters_json_schema=True`
+  in `realtime/realtime_api.py` and `default` retained in `_GeminiJsonSchema.simplify()`
+  (`utils.py`). Same rationale and same caveat for older Live models as v1.0.5.
+- **Tool-result replay across `update_tools` restarts.** A result that lands while the
+  Live session is reconnecting is written to a closing socket, so the model never sees
+  an answer to its call and the conversation stalls silently. The result is held while
+  `_session_should_close` is set and replayed on the new session; on the Gemini API path
+  it is also restated as a user turn to trigger a generation, since the reconnected
+  session has no memory of the originating call. Vertex keeps server-side history and
+  needs no nudge.
+- **gemini-3.1 Live support.** 3.1 reports `mutable_chat_context=False`, which upstream
+  treats as "no agent-initiated turns at all" — `generate_reply` raises `RealtimeError`,
+  so greetings, handoffs and post-tool prompts never happen. 3.1 does honour
+  `LiveClientRealtimeInput(text=...)`, so `generate_reply` is routed through that on 3.1
+  and keeps the placeholder-user-turn path on 2.x. 3.1 also streams `model_turn` parts
+  after a turn is finalized (most visibly after a tool call); upstream opens a fresh
+  generation for them and replays stale audio, so a `_generation_completed` flag now
+  tracks whether the turn is still open and drops the trailing parts.
+- **Recoverable connection errors emitted after the retry backoff.**
+  `_emit_error(recoverable=True)` fired *before* the reconnect sleep, so the consuming
+  error handler tore the agent session down while the plugin was about to reconnect
+  successfully. Moving the emit after the backoff lets a recoverable blip stay
+  recoverable.
+
+**Behaviour change vs v1.0.5:** the gemini-3.1 branches now test `"3.1" in model`
+instead of the exact string `gemini-3.1-flash-live-preview`, matching how upstream
+gates 3.1 itself (`mutable = "3.1" not in model`, `if "3.1" in model:`). Any 3.1 Live
+model is covered, not just the one preview id.
+
+**`pyproject.toml`:** the `livekit-agents` pin gains an upper bound
+(`>=1.8.0,<1.9`). The unbounded `>=1.6.7` in v1.0.5 is precisely what let pip resolve
+the fork onto an incompatible `livekit-agents` release with no warning — bump this
+range in the same change as any future sync. Also picks up upstream's raised floors:
+`google-genai>=2.13` (was `>=1.68`) and `google-cloud-speech>=2.36` (was `>=2`).
+
+**Upstream sync brought in** (`llm.py`, `stt.py`, `tts.py`, `realtime_api.py`,
+`utils.py`, `beta/`, `version.py`, `pyproject.toml`): a genai HTTP client leak fix on
+session close, model-turn text no longer leaking into captions when audio output and
+output transcription are both on, `turn_started_at` on transcription events, `SILENT`
+tool-response scheduling driven by `reply_required`, warnings when
+`tool_response_scheduling` is used on Vertex (which ignores it), PII-tagged debug logs,
+and a new `beta/gemini_stt.py`.
 
 ---
 
